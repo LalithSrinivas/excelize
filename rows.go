@@ -195,6 +195,56 @@ func (rows *Rows) Columns(opts ...Options) ([]string, error) {
 	return rowIterator.cells, rowIterator.err
 }
 
+// ColumnsWithCorrespondingStyles return the current row's column values. This fetches the worksheet
+// data as a stream, returns each cell in a row as is, and will not skip empty
+// rows in the tail of the worksheet.
+func (rows *Rows) ColumnsWithCorrespondingStyles(opts ...Options) ([]string, []int, error) {
+	if rows.curRow > rows.seekRow {
+		return nil, nil, nil
+	}
+	var rowIterator rowXMLIteratorWithStyleID
+	var token xml.Token
+	rows.rawCellValue = rows.f.getOptions(opts...).RawCellValue
+	if rows.sst, rowIterator.err = rows.f.sharedStringsReader(); rowIterator.err != nil {
+		return rowIterator.cells, rowIterator.styleIDs, rowIterator.err
+	}
+	for {
+		if rows.token != nil {
+			token = rows.token
+		} else if token, _ = rows.decoder.Token(); token == nil {
+			break
+		}
+		switch xmlElement := token.(type) {
+		case xml.StartElement:
+			rowIterator.inElement = xmlElement.Name.Local
+			if rowIterator.inElement == "row" {
+				rowNum := 0
+				if rowNum, rowIterator.err = attrValToInt("r", xmlElement.Attr); rowNum != 0 {
+					rows.curRow = rowNum
+				} else if rows.token == nil {
+					rows.curRow++
+				}
+				rows.token = token
+				rows.seekRowOpts = extractRowOpts(xmlElement.Attr)
+				if rows.curRow > rows.seekRow {
+					rows.token = nil
+					return rowIterator.cells, rowIterator.styleIDs, rowIterator.err
+				}
+			}
+			if rows.rowXMLHandlerV2(&rowIterator, &xmlElement, rows.rawCellValue); rowIterator.err != nil {
+				rows.token = nil
+				return rowIterator.cells, rowIterator.styleIDs, rowIterator.err
+			}
+			rows.token = nil
+		case xml.EndElement:
+			if xmlElement.Name.Local == "sheetData" {
+				return rowIterator.cells, rowIterator.styleIDs, rowIterator.err
+			}
+		}
+	}
+	return rowIterator.cells, rowIterator.styleIDs, rowIterator.err
+}
+
 // extractRowOpts extract row element attributes.
 func extractRowOpts(attrs []xml.Attr) RowOpts {
 	rowOpts := RowOpts{Height: defaultRowHeight}
@@ -214,6 +264,14 @@ func extractRowOpts(attrs []xml.Attr) RowOpts {
 func appendSpace(l int, s []string) []string {
 	for i := 1; i < l; i++ {
 		s = append(s, "")
+	}
+	return s
+}
+
+// appendSpaceInt append blank integers to slice by given length and source slice.
+func appendSpaceInt(l int, s []int) []int {
+	for i := 1; i < l; i++ {
+		s = append(s, 0)
 	}
 	return s
 }
@@ -240,6 +298,34 @@ func (rows *Rows) rowXMLHandler(rowIterator *rowXMLIterator, xmlElement *xml.Sta
 		blank := rowIterator.cellCol - len(rowIterator.cells)
 		if val, _ := colCell.getValueFrom(rows.f, rows.sst, raw); val != "" || colCell.F != nil {
 			rowIterator.cells = append(appendSpace(blank, rowIterator.cells), val)
+		}
+	}
+}
+
+// rowXMLIteratorWithStyleID defined runtime use field for the worksheet row SAX parser.
+type rowXMLIteratorWithStyleID struct {
+	err              error
+	inElement        string
+	cellCol, cellRow int
+	cells            []string
+	styleIDs         []int
+}
+
+// rowXMLHandlerV2 parse the row XML element of the worksheet.
+func (rows *Rows) rowXMLHandlerV2(rowIterator *rowXMLIteratorWithStyleID, xmlElement *xml.StartElement, raw bool) {
+	if rowIterator.inElement == "c" {
+		rowIterator.cellCol++
+		colCell := xlsxC{}
+		_ = rows.decoder.DecodeElement(&colCell, xmlElement)
+		if colCell.R != "" {
+			if rowIterator.cellCol, _, rowIterator.err = CellNameToCoordinates(colCell.R); rowIterator.err != nil {
+				return
+			}
+		}
+		blank := rowIterator.cellCol - len(rowIterator.cells)
+		if val, styleID, _ := colCell.getValueAndStyleFrom(rows.f, rows.sst, raw); val != "" || colCell.F != nil {
+			rowIterator.cells = append(appendSpace(blank, rowIterator.cells), val)
+			rowIterator.styleIDs = append(appendSpaceInt(blank, rowIterator.styleIDs), styleID)
 		}
 	}
 }
